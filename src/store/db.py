@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +10,8 @@ import pandas as pd
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "nrc.db"
 
 _SCHEMA = """
+PRAGMA journal_mode=WAL;
+
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_number  TEXT PRIMARY KEY,
     title          TEXT,
@@ -24,13 +27,18 @@ CREATE TABLE IF NOT EXISTS tickets (
     imported_at    TEXT DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_tickets_account    ON tickets(account);
+CREATE INDEX IF NOT EXISTS idx_tickets_issue_type ON tickets(issue_type);
+CREATE INDEX IF NOT EXISTS idx_tickets_created    ON tickets(created);
+CREATE INDEX IF NOT EXISTS idx_tickets_acct_issue ON tickets(account, issue_type);
+
 CREATE TABLE IF NOT EXISTS recommendation_cache (
     cache_key      TEXT PRIMARY KEY,
     pattern_type   TEXT NOT NULL,
     account        TEXT NOT NULL,
     issue_type     TEXT NOT NULL,
-    ticket_numbers TEXT NOT NULL,   -- JSON array
-    result_json    TEXT NOT NULL,   -- full recommendation dict from LLM
+    ticket_numbers TEXT NOT NULL,
+    result_json    TEXT NOT NULL,
     model          TEXT NOT NULL,
     created_at     TEXT DEFAULT (datetime('now'))
 );
@@ -39,7 +47,7 @@ CREATE TABLE IF NOT EXISTS recommendation_cache (
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     conn.commit()
@@ -49,50 +57,51 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
 # ── ticket store ───────────────────────────────────────────────────────────────
 
 def import_tickets(df: pd.DataFrame, conn: sqlite3.Connection) -> tuple[int, int]:
-    """Insert new tickets from a DataFrame, silently skip duplicates.
+    """Bulk-insert new tickets, skip duplicates. Returns (new_count, skipped_count)."""
+    rows = [
+        (
+            row["ticket_number"], row["title"], row["description"],
+            row["account"], row["resources"], row["status"],
+            str(row["created"]), float(row["total_hours"]),
+            float(row["billed_hours"]), row["sub_issue_type"], row["issue_type"],
+        )
+        for _, row in df.iterrows()
+    ]
 
-    Returns (new_count, skipped_count).
-    """
-    new_count = 0
-    skipped_count = 0
-
-    for _, row in df.iterrows():
-        try:
-            conn.execute(
-                """
-                INSERT INTO tickets
-                    (ticket_number, title, description, account, resources,
-                     status, created, total_hours, billed_hours,
-                     sub_issue_type, issue_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["ticket_number"],
-                    row["title"],
-                    row["description"],
-                    row["account"],
-                    row["resources"],
-                    row["status"],
-                    str(row["created"]),
-                    float(row["total_hours"]),
-                    float(row["billed_hours"]),
-                    row["sub_issue_type"],
-                    row["issue_type"],
-                ),
-            )
-            new_count += 1
-        except sqlite3.IntegrityError:
-            skipped_count += 1
-
+    existing_before = ticket_count(conn)
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO tickets
+            (ticket_number, title, description, account, resources,
+             status, created, total_hours, billed_hours,
+             sub_issue_type, issue_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
     conn.commit()
+    existing_after = ticket_count(conn)
+    new_count = existing_after - existing_before
+    skipped_count = len(rows) - new_count
     return new_count, skipped_count
 
 
-def load_all_tickets(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Load every ticket from the store as a DataFrame."""
-    rows = conn.execute("SELECT * FROM tickets ORDER BY created").fetchall()
+def load_tickets(
+    conn: sqlite3.Connection,
+    since_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """Load tickets from the store, optionally filtered to on/after since_date (ISO format)."""
+    if since_date:
+        rows = conn.execute(
+            "SELECT * FROM tickets WHERE created >= ? ORDER BY created",
+            (since_date,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM tickets ORDER BY created").fetchall()
+
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame([dict(r) for r in rows])
     df["created"] = pd.to_datetime(df["created"], errors="coerce")
     df["total_hours"] = pd.to_numeric(df["total_hours"], errors="coerce").fillna(0.0)
@@ -104,15 +113,79 @@ def ticket_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
 
 
+def since_date_from_window(window_days: int) -> str:
+    """Return ISO date string for N days ago."""
+    return (date.today() - timedelta(days=window_days)).isoformat()
+
+
+# ── historical context ─────────────────────────────────────────────────────────
+
+def get_historical_context(
+    account: str,
+    issue_type: str,
+    since_date: str,
+    conn: sqlite3.Connection,
+) -> dict:
+    """Query full ticket history to produce trend context for the LLM prompt.
+
+    Compares the detection window (recent period) against an equal-length prior
+    period so the LLM knows whether this pattern is new, stable, or escalating.
+    """
+    # How many days is the detection window?
+    window_days = (date.today() - date.fromisoformat(since_date)).days or 1
+    prior_start = (date.fromisoformat(since_date) - timedelta(days=window_days)).isoformat()
+
+    # Scope: specific issue_type or whole account if "(multiple)"
+    if issue_type and issue_type != "(multiple)":
+        scope_clause = "AND issue_type = ?"
+        base_params: tuple = (account, issue_type)
+    else:
+        scope_clause = ""
+        base_params = (account,)
+
+    all_time = conn.execute(
+        f"SELECT COUNT(*) as n, MIN(created) as first_seen "
+        f"FROM tickets WHERE account = ? {scope_clause}",
+        base_params,
+    ).fetchone()
+
+    recent = conn.execute(
+        f"SELECT COUNT(*) FROM tickets "
+        f"WHERE account = ? {scope_clause} AND created >= ?",
+        (*base_params, since_date),
+    ).fetchone()[0]
+
+    prior = conn.execute(
+        f"SELECT COUNT(*) FROM tickets "
+        f"WHERE account = ? {scope_clause} AND created >= ? AND created < ?",
+        (*base_params, prior_start, since_date),
+    ).fetchone()[0]
+
+    if prior > 0:
+        trend_pct = round((recent - prior) / prior * 100, 1)
+        trend_label = (
+            f"+{trend_pct}% vs prior {window_days}-day period (INCREASING)"
+            if trend_pct > 10
+            else f"{trend_pct}% vs prior period (DECREASING)"
+            if trend_pct < -10
+            else f"{trend_pct}% vs prior period (STABLE)"
+        )
+    else:
+        trend_label = "No data in prior period (new or recently emerged pattern)"
+
+    return {
+        "all_time_count": all_time["n"],
+        "first_seen": (all_time["first_seen"] or "")[:10],
+        "recent_count": recent,
+        "prior_count": prior,
+        "trend_label": trend_label,
+    }
+
+
 # ── recommendation cache ───────────────────────────────────────────────────────
 
 def _cache_key(pattern_type: str, account: str, issue_type: str,
                ticket_numbers: list[str], model: str) -> str:
-    """Stable SHA-256 fingerprint for a pattern cluster.
-
-    The key changes whenever the set of tickets changes or the model changes,
-    which automatically invalidates stale cache entries.
-    """
     canonical = f"{pattern_type}|{account}|{issue_type}|{','.join(sorted(ticket_numbers))}|{model}"
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -120,7 +193,6 @@ def _cache_key(pattern_type: str, account: str, issue_type: str,
 def cache_get(pattern_type: str, account: str, issue_type: str,
               ticket_numbers: list[str], model: str,
               conn: sqlite3.Connection) -> Optional[dict]:
-    """Return cached recommendation dict, or None if not cached."""
     key = _cache_key(pattern_type, account, issue_type, ticket_numbers, model)
     row = conn.execute(
         "SELECT result_json FROM recommendation_cache WHERE cache_key = ?", (key,)
@@ -131,7 +203,6 @@ def cache_get(pattern_type: str, account: str, issue_type: str,
 def cache_set(pattern_type: str, account: str, issue_type: str,
               ticket_numbers: list[str], model: str,
               result: dict, conn: sqlite3.Connection) -> None:
-    """Store a recommendation result in the cache."""
     key = _cache_key(pattern_type, account, issue_type, ticket_numbers, model)
     conn.execute(
         """
@@ -141,20 +212,15 @@ def cache_set(pattern_type: str, account: str, issue_type: str,
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            key,
-            pattern_type,
-            account,
-            issue_type,
+            key, pattern_type, account, issue_type,
             json.dumps(sorted(ticket_numbers)),
-            json.dumps(result),
-            model,
+            json.dumps(result), model,
         ),
     )
     conn.commit()
 
 
 def cache_clear(conn: sqlite3.Connection) -> int:
-    """Delete all cached recommendations. Returns number of rows deleted."""
     cursor = conn.execute("DELETE FROM recommendation_cache")
     conn.commit()
     return cursor.rowcount

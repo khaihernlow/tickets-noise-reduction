@@ -3,13 +3,15 @@ NRC AI -- Noise Reduction Committee Analysis Tool
 Tag Solutions, Albany NY
 
 Commands:
-  python main.py import <csv_file> [...]       Import tickets into local store
-  python main.py analyze                        Analyze all stored tickets
-  python main.py analyze <csv_file> [...]       Import then analyze in one step
-  python main.py analyze --force-refresh        Re-run LLM on all patterns (ignore cache)
-  python main.py status                         Show store and cache stats
-  python main.py models                         List available HatzAI models
-  python main.py cache-clear                    Wipe cached recommendations
+  python main.py import <csv_file> [...]            Import tickets into local store
+  python main.py analyze                             Analyze all stored tickets
+  python main.py analyze --window 30                 Analyze last 30 days only
+  python main.py analyze --since 2026-01-01          Analyze tickets since a date
+  python main.py analyze <csv_file> [...]            Import then analyze in one step
+  python main.py analyze --force-refresh             Re-run LLM on all patterns (ignore cache)
+  python main.py status                              Show store and cache stats
+  python main.py models                              List available HatzAI models
+  python main.py cache-clear                         Wipe cached recommendations
 """
 
 import argparse
@@ -24,8 +26,9 @@ from src.ingest.csv_importer import load_csv
 from src.analysis.patterns import find_patterns
 from src.analysis.recommender import generate_recommendations
 from src.store.db import (
-    connect, import_tickets, load_all_tickets,
+    connect, import_tickets, load_tickets,
     ticket_count, cache_clear, cache_stats,
+    since_date_from_window,
 )
 
 
@@ -106,6 +109,16 @@ def cmd_import(args) -> None:
 def cmd_analyze(args) -> None:
     conn = connect()
 
+    # ── resolve detection window ───────────────────────────────────────────────
+    since_date = None
+    window_label = "all time"
+    if getattr(args, "since", None):
+        since_date = args.since
+        window_label = f"since {since_date}"
+    elif getattr(args, "window", None):
+        since_date = since_date_from_window(args.window)
+        window_label = f"last {args.window} days (since {since_date})"
+
     # ── optionally import CSV files first ──────────────────────────────────────
     if hasattr(args, "csv_files") and args.csv_files:
         print(f"Importing {len(args.csv_files)} CSV file(s)...")
@@ -117,14 +130,15 @@ def cmd_analyze(args) -> None:
             except Exception as e:
                 print(f"  ERROR loading {path}: {e}")
 
-    # ── load all tickets from store ────────────────────────────────────────────
-    df = load_all_tickets(conn)
+    # ── load tickets (detection scope) ────────────────────────────────────────
+    df = load_tickets(conn, since_date=since_date)
     if df.empty:
         print("\nNo tickets in store. Run: python main.py import <csv_file>")
         conn.close()
         return
 
-    print(f"\nAnalyzing {len(df)} tickets across {df['account'].nunique()} accounts.")
+    print(f"\nAnalyzing {len(df)} tickets across {df['account'].nunique()} accounts "
+          f"({window_label}).")
 
     # ── summary ────────────────────────────────────────────────────────────────
     print_header("TICKET SUMMARY")
@@ -153,9 +167,14 @@ def cmd_analyze(args) -> None:
     patterns = patterns[:top_n]
 
     print(tabulate(
-        [[i, p.pattern_type, p.account[:35], p.issue_type[:25], p.ticket_count, f"{p.total_hours}h"]
-         for i, p in enumerate(patterns, 1)],
-        headers=["#", "Pattern Type", "Account", "Issue Type", "Tickets", "Hours"],
+        [
+            [i, p.pattern_type, p.account[:35], p.issue_type[:25],
+             p.ticket_count, p.unique_contacts,
+             f"{p.recurrence_rate}/wk", f"{round(p.account_noise_ratio * 100, 1)}%"]
+            for i, p in enumerate(patterns, 1)
+        ],
+        headers=["#", "Pattern Type", "Account", "Issue Type",
+                 "Tickets", "Contacts", "Rate", "% of Acct"],
         tablefmt="simple",
     ))
 
@@ -174,7 +193,7 @@ def cmd_analyze(args) -> None:
 
     try:
         recommendations = generate_recommendations(
-            patterns, client, conn=conn, force_refresh=force
+            patterns, client, conn=conn, since_date=since_date, force_refresh=force
         )
     except HatzAIError as e:
         print(f"ERROR calling HatzAI: {e}")
@@ -198,8 +217,7 @@ def cmd_analyze(args) -> None:
         print(f"  Account : {rec.pattern.account}")
         print(f"  Tickets : {', '.join(rec.source_ticket_numbers[:8])}"
               + (" ..." if len(rec.source_ticket_numbers) > 8 else ""))
-        print(f"  Impact  : ~{rec.estimated_monthly_tickets_prevented} tickets/mo  |  "
-              f"~{rec.estimated_monthly_hours_saved}h saved/mo")
+        print(f"  Impact  : ~{rec.estimated_monthly_tickets_prevented} tickets/mo prevented")
         print()
         print(f"  PATTERN\n  {rec.pattern_summary}")
         print()
@@ -209,10 +227,8 @@ def cmd_analyze(args) -> None:
 
     print(f"\n{'-'*78}")
     total_tickets = sum(r.estimated_monthly_tickets_prevented for r in recommendations)
-    total_hours = sum(r.estimated_monthly_hours_saved for r in recommendations)
     print(f"\n  TOTAL ESTIMATED IMPACT (monthly)")
     print(f"  Tickets prevented : ~{total_tickets}")
-    print(f"  Hours saved       : ~{total_hours:.1f}h")
     print()
 
 
@@ -249,6 +265,14 @@ def main():
                      help="Show pattern stats only, skip LLM calls")
     ana.add_argument("--force-refresh", action="store_true",
                      help="Ignore recommendation cache, re-run LLM on all patterns")
+
+    window_group = ana.add_mutually_exclusive_group()
+    window_group.add_argument("--window", type=int, metavar="DAYS",
+                              help="Only analyze tickets from the last N days "
+                                   "(historical data still used for trend context)")
+    window_group.add_argument("--since", metavar="DATE",
+                              help="Only analyze tickets on or after this date "
+                                   "(ISO format: YYYY-MM-DD)")
 
     args = parser.parse_args()
 

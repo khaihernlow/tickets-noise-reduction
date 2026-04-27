@@ -2,54 +2,76 @@ import pandas as pd
 from typing import List
 from ..models.ticket import Pattern
 
-# Minimum tickets in a group before it's considered a pattern worth reviewing
 MIN_CLUSTER_SIZE = 2
-HIGH_EFFORT_THRESHOLD = 0.5  # hours
 
 
 def find_patterns(df: pd.DataFrame) -> List[Pattern]:
+    # pre-compute per-account totals once so every detector can compute noise ratio
+    account_totals = df.groupby("account").size().to_dict()
+
     patterns: List[Pattern] = []
+    patterns.extend(_recurring_issue_patterns(df, account_totals))
+    patterns.extend(_repeat_contact_patterns(df, account_totals))
+    patterns.extend(_same_day_burst_patterns(df, account_totals))
 
-    patterns.extend(_recurring_issue_patterns(df))
-    patterns.extend(_repeat_contact_patterns(df))
-    patterns.extend(_high_effort_patterns(df))
-    patterns.extend(_same_day_burst_patterns(df))
-
-    # deduplicate: a ticket can appear in multiple pattern types but we want
-    # the most specific grouping first — sort by ticket_count desc, then hours desc
-    patterns.sort(key=lambda p: (p.ticket_count, p.total_hours), reverse=True)
+    patterns.sort(key=lambda p: (p.ticket_count, p.unique_contacts), reverse=True)
     return patterns
 
 
 def _to_records(group: pd.DataFrame) -> list:
-    cols = ["ticket_number", "title", "description", "resources", "created", "total_hours", "issue_type", "sub_issue_type"]
+    cols = ["ticket_number", "title", "description", "resources",
+            "created", "issue_type", "sub_issue_type"]
     return group[cols].to_dict("records")
 
 
-def _recurring_issue_patterns(df: pd.DataFrame) -> List[Pattern]:
+def _pattern_stats(group: pd.DataFrame, account: str, account_totals: dict) -> dict:
+    """Compute reliable, hours-free stats for a cluster."""
+    ticket_count = len(group)
+    unique_contacts = group["resources"].nunique()
+
+    if ticket_count > 1:
+        age_days = (group["created"].max() - group["created"].min()).days
+    else:
+        age_days = 0
+
+    # minimum 1 day to avoid division by zero; same-day bursts correctly get a high rate
+    weeks = max(age_days / 7, 1 / 7)
+    recurrence_rate = round(ticket_count / weeks, 2)
+
+    noise_ratio = round(ticket_count / max(account_totals.get(account, 1), 1), 3)
+
+    return {
+        "unique_contacts": unique_contacts,
+        "cluster_age_days": age_days,
+        "recurrence_rate": recurrence_rate,
+        "account_noise_ratio": noise_ratio,
+    }
+
+
+def _recurring_issue_patterns(df: pd.DataFrame, account_totals: dict) -> List[Pattern]:
     """Same account + issue_type appearing multiple times."""
     results = []
     valid = df[df["issue_type"] != ""]
     for (account, issue_type), group in valid.groupby(["account", "issue_type"]):
         if len(group) < MIN_CLUSTER_SIZE:
             continue
+        stats = _pattern_stats(group, account, account_totals)
         results.append(Pattern(
             pattern_type="recurring_issue",
             account=account,
             issue_type=issue_type,
             ticket_count=len(group),
-            total_hours=round(group["total_hours"].sum(), 2),
             tickets=_to_records(group),
             sub_issue_breakdown=group["sub_issue_type"].value_counts().to_dict(),
+            **stats,
         ))
     return results
 
 
-def _repeat_contact_patterns(df: pd.DataFrame) -> List[Pattern]:
-    """Single end-user generating multiple tickets — training opportunity."""
+def _repeat_contact_patterns(df: pd.DataFrame, account_totals: dict) -> List[Pattern]:
+    """Single technician resource handling many tickets for the same account."""
     results = []
 
-    # Extract primary contact from Resources column (format: "LastName, FirstName (primary)")
     def extract_primary(resources_str: str) -> str:
         if not resources_str:
             return ""
@@ -65,56 +87,37 @@ def _repeat_contact_patterns(df: pd.DataFrame) -> List[Pattern]:
     for (account, contact), group in valid.groupby(["account", "_primary_resource"]):
         if len(group) < MIN_CLUSTER_SIZE:
             continue
+        stats = _pattern_stats(group, account, account_totals)
         results.append(Pattern(
             pattern_type="repeat_contact",
             account=account,
             issue_type="(multiple)",
             ticket_count=len(group),
-            total_hours=round(group["total_hours"].sum(), 2),
             tickets=_to_records(group),
             contact=contact,
             sub_issue_breakdown=group["issue_type"].value_counts().to_dict(),
+            **stats,
         ))
     return results
 
 
-def _high_effort_patterns(df: pd.DataFrame) -> List[Pattern]:
-    """Tickets consuming > HIGH_EFFORT_THRESHOLD hours for an issue type that recurs."""
-    high = df[df["total_hours"] > HIGH_EFFORT_THRESHOLD]
-    results = []
-    valid = high[high["issue_type"] != ""]
-    for (account, issue_type), group in valid.groupby(["account", "issue_type"]):
-        if len(group) < MIN_CLUSTER_SIZE:
-            continue
-        results.append(Pattern(
-            pattern_type="high_effort",
-            account=account,
-            issue_type=issue_type,
-            ticket_count=len(group),
-            total_hours=round(group["total_hours"].sum(), 2),
-            tickets=_to_records(group),
-            sub_issue_breakdown=group["sub_issue_type"].value_counts().to_dict(),
-            extra={"avg_hours": round(group["total_hours"].mean(), 2)},
-        ))
-    return results
-
-
-def _same_day_burst_patterns(df: pd.DataFrame) -> List[Pattern]:
-    """Multiple tickets from the same account on the same day — suggests an incident or deployment issue."""
+def _same_day_burst_patterns(df: pd.DataFrame, account_totals: dict) -> List[Pattern]:
+    """3+ tickets from the same account on the same calendar day."""
     df = df.copy()
     df["_date"] = df["created"].dt.date
     results = []
     for (account, date), group in df.groupby(["account", "_date"]):
-        if len(group) < 3:  # higher threshold — 2 tickets in a day is normal
+        if len(group) < 3:
             continue
+        stats = _pattern_stats(group, account, account_totals)
         results.append(Pattern(
             pattern_type="same_day_burst",
             account=account,
             issue_type="(multiple)",
             ticket_count=len(group),
-            total_hours=round(group["total_hours"].sum(), 2),
             tickets=_to_records(group),
             sub_issue_breakdown=group["issue_type"].value_counts().to_dict(),
             extra={"date": str(date)},
+            **stats,
         ))
     return results
